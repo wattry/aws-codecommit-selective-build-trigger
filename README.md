@@ -24,11 +24,11 @@ First, zip and upload the lambda code to an S3 bucket
 
 `zip lambda.zip lambda_code.py`
 
-`aws s3 cp lambda.zip s3://aws-codecommit-selective-build-trigger/`
+`aws s3 cp lambda.zip s3://wattry-codecommit-selective-build-ecs-pipeline/`
 
 Trigger the cloudformation stack creation pointing to that S3 bucket zip.
 
-`aws cloudformation create-stack --stack-name myteststack --template-body file://src/aws-codecommit-selective-build-trigger.yml --parameters ParameterKey=ProjectName,ParameterValue=testproject ParameterKey=LambdaZipS3Bucket,ParameterValue=aws-codecommit-selective-build-trigger ParameterKey=LambdaZipS3Key,ParameterValue=lambda.zip --capabilities CAPABILITY_NAMED_IAM`
+`aws cloudformation create-stack --stack-name <your-stack-name> --template-body file://src/aws-codecommit-selective-build-trigger.yml --capabilities CAPABILITY_NAMED_IAM`
 
 ## Components details
 

@@ -1,0 +1,23 @@
+{
+  "name": "aws-codecommit-selective-build-trigger",
+  "version": "1.0.0",
+  "description": "This demo illustrates the deployment of AWS Lambda to build Docker Images of application in AWS CodeCommit repository automatically when selective files are modified and the changes are pushed to the repository. The AWS Lambda receives the AWS CodeCommit events for push to repository and triggers a AWS CodeBuild job to build the Docker image and push to AWS Elastic Container Registry.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/aws-samples/aws-codecommit-selective-build-trigger.git"
+  },
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/aws-samples/aws-codecommit-selective-build-trigger/issues"
+  },
+  "homepage": "https://github.com/aws-samples/aws-codecommit-selective-build-trigger#readme",
+  "devDependencies": {
+    "aws-sdk": "^2.827.0",
+    "dotenv": "^8.2.0"
+  }
+}

@@ -22,12 +22,12 @@ Parameters:
     AllowedPattern: '[a-z0-9.-]*'
     ConstraintDescription: Project Name must contain only lowercase a-z, 0-9 and -
       characters.
-    Default: sampletest
+    Default: wattry-ecr-poc
     Description: Define the Name of the Project such as test/data etc. (Value must
       be comprised only of lowercase a-z, 0-9, .-)
     Type: String
   LambdaZipS3Bucket:
-    Default: codecommit-selective-build
+    Default: wattry-codecommit-selective-build-ecs-pipeline
     Description: Define the Name of the S3 Bucket containing Lambda code zip
     Type: String
   LambdaZipS3Key:
@@ -38,16 +38,15 @@ Resources:
   CodeCommitRepository:
     Type: AWS::CodeCommit::Repository
     Properties:
-      RepositoryDescription: !Sub ${ProjectName}CodeRepo
-      RepositoryName: !Sub ${ProjectName}coderepo
+      RepositoryDescription: !Sub ${ProjectName}
+      RepositoryName: !Sub ${ProjectName}
       Triggers: 
-        - Name: MasterTrigger
-          CustomData: Project ID sampletest
+        - Name: ImageBuildTrigger
+          CustomData: !Sub 'Project ID ${ProjectName}'
           DestinationArn: !GetAtt  LambdaTrigger.Arn
-          Branches:
-          - master
+          Branches: []
           Events:
-          - updateReference
+          - all
   CodeBuildImageRole:
     Type: AWS::IAM::Role
     Properties:
@@ -105,22 +104,19 @@ Resources:
               commands:
                 - echo Phase INSTALL was STARTED on `date`
                 - echo "Installing Pre-Requisites..."
-                - python3 -m pip install pip --upgrade || exit 1
                 - echo "Cleaning up un-needed files..." && rm -fr .git .gitignore readme.md README.md Readme.md ReadMe.md || exit 0 && echo "Cleanup Completed!"
                 - echo "Logging in to Amazon ECR..."
                 - $(aws ecr get-login --region $AWS_DEFAULT_REGION --no-include-email)
-                - ECR_REPOSITORY_URI=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_REPO
                 - COMMIT_HASH=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)
-                - IMAGE_TAG=${COMMIT_HASH:=latest}
+                - IMAGE_TAG=$BRANCH_NAME\_${COMMIT_HASH:=latest}
               finally:
                 - echo Phase INSTALL was COMPLETED on `date`
                 - if [ "$CODEBUILD_BUILD_SUCCEEDING" -eq 1 ]; then echo 'INSTALL SUCCESSFUL'; else echo 'INSTALL FAILED'; exit 1; fi
             build:
               commands:
                 - echo Phase BUILD was STARTED on `date`
-                - echo "Building the Docker image..."
-                - docker build -t $ECR_REPOSITORY_URI:latest .
-                - docker tag $ECR_REPOSITORY_URI:latest $ECR_REPOSITORY_URI:$IMAGE_TAG
+                - echo "Building the Docker image from " $APP_DIR
+                - docker build -f $APP_DIR/Dockerfile -t $ECR_REPO_URI:latest .
               finally:
                 - echo Phase BUILD was COMPLETED on `date`
                 - if [ "$CODEBUILD_BUILD_SUCCEEDING" -eq 1 ]; then echo 'IMAGE BUILD SUCCESSFUL'; else echo 'IMAGE BUILD FAILED'; exit 1; fi
@@ -128,8 +124,7 @@ Resources:
               commands:
                 - echo Phase POST_BUILD was STARTED on `date`
                 - echo "Pushing the Docker image to ECR..."
-                - docker push $ECR_REPOSITORY_URI:latest
-                - docker push $ECR_REPOSITORY_URI:$IMAGE_TAG
+                - docker push $ECR_REPO_URI:latest
               finally:
                 - echo Phase POST_BUILD was COMPLETED on `date`
                 - if [ "$CODEBUILD_BUILD_SUCCEEDING" -eq 1 ]; then echo 'IMAGE POST BUILD SUCCESSFUL'; else echo 'IMAGE POST BUILD FAILED'; exit 1; fi
@@ -144,15 +139,15 @@ Resources:
       Code:
         S3Bucket: !Ref 'LambdaZipS3Bucket'
         S3Key: !Ref 'LambdaZipS3Key'
-      Description: Lambda function that will recieve CodeCommit events and will trigger
+      Description: Lambda function that will receive CodeCommit events and will trigger
         CodeBuild docker image build job.
       FunctionName: !Sub '${CodeBuildImageJob}-Lambda-Trigger'
-      Handler: lambda_code.lambda_handler
+      Handler: index.handler
       MemorySize: 512
       Role: !Sub
         - arn:aws:iam::${AWS::AccountId}:role/${Param1}
         - Param1: !Sub ${ProjectName}-Lambda-CodeBuild-Trigger-Role
-      Runtime: python3.6
+      Runtime: nodejs12.x
       Tags:
         - Key: Project
           Value: !Ref 'ProjectName'
@@ -160,7 +155,6 @@ Resources:
       Environment:
         Variables:
           CODE_BUILD_PROJECT: !Ref CodeBuildImageJob
-          ECR_REPO_NAME: !Ref ECRRepository
   LambdaTriggerRole:
     Type: AWS::IAM::Role
     Properties:
@@ -197,8 +191,15 @@ Resources:
                   - codecommit:BatchGetCommits
                 Effect: Allow
                 Resource:
-                  - !Sub 'arn:aws:codecommit:${AWS::Region}:${AWS::AccountId}:${ProjectName}coderepo'
+                  - !Sub 'arn:aws:codecommit:${AWS::Region}:${AWS::AccountId}:${ProjectName}'
                 Sid: CodeCommitRead
+              - Action:
+                  - ecr:DescribeRepositories
+                  - ecr:CreateRepository
+                Effect: Allow
+                Resource:
+                  - !Sub 'arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:*'
+                Sid: EcrReadWrite
               - Action:
                   - codebuild:StartBuild
                 Effect: Allow
@@ -216,7 +217,3 @@ Resources:
       Action: lambda:InvokeFunction
       FunctionName: !Ref 'LambdaTrigger'
       Principal: codecommit.amazonaws.com
-  ECRRepository:
-      Type: AWS::ECR::Repository
-      Properties:
-        RepositoryName: !Sub ${ProjectName}-imagerepo
