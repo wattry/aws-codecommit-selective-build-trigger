@@ -9,7 +9,6 @@ const {
   sep
 } = require('path');
 
-const EXTENSIONS = ["js"];
 const FILENAMES = ["DockerFile", "Dockerfile"];
 const {
   CODE_BUILD_PROJECT
@@ -86,6 +85,29 @@ async function checkEcrRepository(repositoryName) {
   }
 }
 
+/**
+ * Initiates codebuild pipeline in the queue.
+ * @param {Array[{ NAME: String, VALUE: any, TYPE: string }]} environmentVariablesOverride
+ * @returns {Promise} - logs out when build is queued.
+ */
+async function buildImage(environmentVariablesOverride) {
+  try {
+    const buildOptions = {
+      projectName: CODE_BUILD_PROJECT,
+      sourceVersion: commitHash,
+      sourceTypeOverride: 'CODECOMMIT',
+      sourceLocationOverride: `https://git-codecommit.${awsRegion}.amazonaws.com/v1/repos/${gitRepoName}`,
+      environmentVariablesOverride
+    };
+
+    await codebuild.startBuild(buildOptions).promise();
+
+    console.log('Queued pipeline build');
+  } catch (error) {
+    console.error('Unable to queue pipeline build:', error);
+  }
+}
+
 exports.handler = async (event) => {
   try {
     console.log('event', event);
@@ -97,6 +119,7 @@ exports.handler = async (event) => {
             commit,
             commitHash = commit || getLastCommitID(gitRepoName, branchName),
             ref,
+            deleted,
             branchName = basename(ref)
           }]
         },
@@ -105,35 +128,27 @@ exports.handler = async (event) => {
         accountId = eventSourceARN.split(':')[4]
       }]
     } = event;
+
     const { parents: [previousCommitID] } = await getLastCommitLog(gitRepoName, commitHash);
     const differences = await getFileDifferences(gitRepoName, commitHash, previousCommitID);
-    const imagesToBuild = [];
-    const isImageBuilt = [];
+    const imageActions = [];
 
     for (let i = 0; i < differences.length; i++) {
-      console.log('diff', JSON.stringify(differences[i]));
       const {
         afterBlob: {
           path,
           directory = path.split(sep).shift(),
-          file = basename(path).split('.')
+          fileName = basename(path)
         }
       } = differences[i];
-      const [fileName, extension] = file;
 
-      if ((EXTENSIONS.includes(extension) || FILENAMES.includes(fileName)) && !isImageBuilt.includes(directory)) {
-        isImageBuilt.push(directory);
-        imagesToBuild.push(
+      if (FILENAMES.includes(fileName)) {
+        imageActions.push(
           checkEcrRepository(`customer-portal-${directory}-${branchName}`)
-            .then(({ repositoryName, repositoryUri, repositoryArn }) => {
-              console.log('repositoryName', repositoryName, 'repositoryUri', repositoryUri, 'repositoryArn', repositoryArn);
-
-              const buildOptions = {
-                projectName: CODE_BUILD_PROJECT,
-                sourceVersion: commitHash,
-                sourceTypeOverride: 'CODECOMMIT',
-                sourceLocationOverride: `https://git-codecommit.${awsRegion}.amazonaws.com/v1/repos/${gitRepoName}`,
-                environmentVariablesOverride: [
+            .then(({ repositoryName: ecrRepositoryName, repositoryUri: ecrRepositoryUri, repositoryArn: ecrRepositoryArn }) => {
+              return deleted
+                ? ecr.deleteRepository({ repositoryArn: ecrRepositoryArn }).promise()
+                : buildImage(ecrRepositoryName, [
                   {
                     name: 'AWS_DEFAULT_REGION',
                     value: awsRegion,
@@ -141,11 +156,11 @@ exports.handler = async (event) => {
                   },
                   {
                     name: 'ECR_REPO',
-                    value: repositoryName,
+                    value: ecrRepositoryName,
                     type: 'PLAINTEXT'
                   }, {
                     name: 'ECR_REPO_URI',
-                    value: repositoryUri,
+                    value: ecrRepositoryUri,
                     type: 'PLAINTEXT'
                   }, {
                     name: 'AWS_ACCOUNT_ID',
@@ -162,20 +177,13 @@ exports.handler = async (event) => {
                     value: branchName,
                     type: 'PLAINTEXT'
                   }
-                ]
-              };
-
-              return codebuild.startBuild(buildOptions).promise().then(() => {
-                console.log('Image build queued: %s', directory);
-              });
+                ]);
             })
         );
-      } else if (isImageBuilt.includes(directory)) {
-        console.log('Skipping build. %s is already queued', directory);
       }
     }
 
-    return Promise.allSettled(imagesToBuild);
+    return Promise.allSettled(imageActions);
   } catch (error) {
     console.error('An error occurred building images', error);
   }
