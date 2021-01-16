@@ -196,6 +196,7 @@ Resources:
               - Action:
                   - ecr:DescribeRepositories
                   - ecr:CreateRepository
+                  - ecr:DeleteRepository
                 Effect: Allow
                 Resource:
                   - !Sub 'arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:*'

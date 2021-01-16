@@ -9,9 +9,10 @@ const {
   sep
 } = require('path');
 
+const EXTENSIONS = ["js"];
 const FILENAMES = ["DockerFile", "Dockerfile"];
 const {
-  CODE_BUILD_PROJECT
+  CODE_BUILD_PROJECT = 'wattry-ecr-poc-CodeBuild-Job'
 } = process.env;
 
 async function getLastCommitID(repositoryName, branchName) {
@@ -60,6 +61,20 @@ async function getFileDifferences(repositoryName, lastCommitID, previousCommitID
   return differences;
 }
 
+function getServicesDirectories(repositoryName, folderPath, commitSpecifier) {
+  return codecommit.getFolder({ repositoryName, folderPath, commitSpecifier }).promise()
+}
+
+async function createEcrRepository(repositoryName) {
+  const { repository } = await ecr
+    .createRepository({ repositoryName })
+    .promise();
+
+  console.log('Creating repository: %s', repositoryName);
+
+  return repository;
+}
+
 async function checkEcrRepository(repositoryName) {
   try {
     const { repositories: [repository] } = await ecr
@@ -71,9 +86,7 @@ async function checkEcrRepository(repositoryName) {
     // If the ecr repository does not exist, then create one with the name provided.
     if (error.name && error.name === 'RepositoryNotFoundException') {
       try {
-        const { repository } = await ecr
-          .createRepository({ repositoryName })
-          .promise();
+        const { repository } = createEcrRepository(repositoryName);
 
         return repository;
       } catch (error) {
@@ -90,101 +103,168 @@ async function checkEcrRepository(repositoryName) {
  * @param {Array[{ NAME: String, VALUE: any, TYPE: string }]} environmentVariablesOverride
  * @returns {Promise} - logs out when build is queued.
  */
-async function buildImage(environmentVariablesOverride) {
+async function buildImage(
+  commitHash,
+  awsRegion,
+  gitRepoName,
+  { repositoryName, repositoryUri },
+  imageDirectory,
+  accountId,
+  branchName,
+  environmentVariablesOverride = []
+) {
   try {
     const buildOptions = {
       projectName: CODE_BUILD_PROJECT,
       sourceVersion: commitHash,
       sourceTypeOverride: 'CODECOMMIT',
       sourceLocationOverride: `https://git-codecommit.${awsRegion}.amazonaws.com/v1/repos/${gitRepoName}`,
-      environmentVariablesOverride
+      environmentVariablesOverride: [
+        {
+          name: 'AWS_DEFAULT_REGION',
+          value: awsRegion,
+          type: 'PLAINTEXT'
+        },
+        {
+          name: 'ECR_REPO',
+          value: repositoryName,
+          type: 'PLAINTEXT'
+        }, {
+          name: 'ECR_REPO_URI',
+          value: repositoryUri,
+          type: 'PLAINTEXT'
+        }, {
+          name: 'AWS_ACCOUNT_ID',
+          value: accountId,
+          type: 'PLAINTEXT'
+        },
+        {
+          name: 'APP_DIR',
+          value: imageDirectory,
+          type: 'PLAINTEXT'
+        },
+        {
+          name: 'BRANCH_NAME',
+          value: branchName,
+          type: 'PLAINTEXT'
+        },
+        ...environmentVariablesOverride
+      ]
     };
 
-    await codebuild.startBuild(buildOptions).promise();
+    const result = await codebuild.startBuild(buildOptions).promise();
 
     console.log('Queued pipeline build');
+
+    return result;
   } catch (error) {
     console.error('Unable to queue pipeline build:', error);
   }
 }
 
-exports.handler = async (event) => {
+async function deleteEcrRepository(branchName) {
   try {
-    console.log('event', event);
+    const { repositories } = await ecr.describeRepositories().promise();
+    const regex = new RegExp(`^customer-portal.*.${branchName}$`);
+    const repositoriesToDelete = repositories.map(({ repositoryName }) => {
+      if (!/master|main|dev|prod/.test(branchName) && regex.test(repositoryName)) {
+        return ecr.deleteRepository({ repositoryName, force: true }).promise()
+          .then(() => {
+            console.log('Repository "%s" scheduled for deletion', repositoryName);
+            return { status: 'deleted', repositoryName };
+          })
+      }
+
+      return { status: 'skipped', repositoryName };
+    });
+
+    return Promise.allSettled(repositoriesToDelete);
+  } catch (error) {
+    console.log('An error occurred deleting %s repository', branchName, error);
+  }
+}
+
+async function createServiceRepositories(gitRepoName, commitHash, servicesPath, branchName, build) {
+  const { subFolders: serviceNames } = await getServicesDirectories(gitRepoName, servicesPath, commitHash);
+
+  return serviceNames
+    .map(({
+      relativePath: serviceName,
+      absolutePath: serviceDirectory
+    }) => createEcrRepository(`customer-portal-${(serviceName)}-${branchName}`)
+      .then(repository => build(repository, serviceName, serviceDirectory))
+      .catch(error => console.error('Unable to create service repository.', error.message))
+    );
+}
+
+async function updateErcImages(gitRepoName, commitHash, branchName, build) {
+  const { parents: [previousCommitID] } = await getLastCommitLog(gitRepoName, commitHash);
+  const differences = await getFileDifferences(gitRepoName, commitHash, previousCommitID);
+  const hasQueuedBuild = [];
+
+  const builds = differences.map(difference => {
+    const {
+      afterBlob: {
+        path
+      },
+      serviceDirectory,
+      serviceName = path.split(sep),
+      file = basename(path).split('.')
+    } = difference;
+    const [fileName, extension] = file;
+
+    return
+
+    if ((EXTENSIONS.includes(extension) || FILENAMES.includes(fileName)) && !hasQueuedBuild.includes(imageDirectory)) {
+      hasQueuedBuild.push(imageDirectory);
+
+      return checkEcrRepository(`customer-portal-${imageDirectory}-${branchName}`)
+        .then(repository => build(repository, imageDirectory));
+    }
+
+    console.log('Skipped %s', file);
+  });
+
+  return Promise.allSettled(builds);
+}
+
+const handler = async (event) => {
+  try {
+    // console.log('event', JSON.stringify(event));
     const {
       Records: [{
         awsRegion,
         codecommit: {
           references: [{
             commit,
-            commitHash = commit || getLastCommitID(gitRepoName, branchName),
             ref,
             deleted,
-            branchName = basename(ref)
+            created
           }]
         },
         eventSourceARN,
-        gitRepoName = eventSourceARN.split(':').pop(),
-        accountId = eventSourceARN.split(':')[4]
-      }]
+      }],
+      gitRepoName = eventSourceARN.split(':').pop(),
+      accountId = eventSourceARN.split(':')[4],
+      branchName = basename(ref),
+      commitHash = commit || getLastCommitID(gitRepoName, branchName),
     } = event;
 
-    const { parents: [previousCommitID] } = await getLastCommitLog(gitRepoName, commitHash);
-    const differences = await getFileDifferences(gitRepoName, commitHash, previousCommitID);
-    const imageActions = [];
-
-    for (let i = 0; i < differences.length; i++) {
-      const {
-        afterBlob: {
-          path,
-          directory = path.split(sep).shift(),
-          fileName = basename(path)
-        }
-      } = differences[i];
-
-      if (FILENAMES.includes(fileName)) {
-        imageActions.push(
-          checkEcrRepository(`customer-portal-${directory}-${branchName}`)
-            .then(({ repositoryName: ecrRepositoryName, repositoryUri: ecrRepositoryUri, repositoryArn: ecrRepositoryArn }) => {
-              return deleted
-                ? ecr.deleteRepository({ repositoryArn: ecrRepositoryArn }).promise()
-                : buildImage(ecrRepositoryName, [
-                  {
-                    name: 'AWS_DEFAULT_REGION',
-                    value: awsRegion,
-                    type: 'PLAINTEXT'
-                  },
-                  {
-                    name: 'ECR_REPO',
-                    value: ecrRepositoryName,
-                    type: 'PLAINTEXT'
-                  }, {
-                    name: 'ECR_REPO_URI',
-                    value: ecrRepositoryUri,
-                    type: 'PLAINTEXT'
-                  }, {
-                    name: 'AWS_ACCOUNT_ID',
-                    value: accountId,
-                    type: 'PLAINTEXT'
-                  },
-                  {
-                    name: 'APP_DIR',
-                    value: directory,
-                    type: 'PLAINTEXT'
-                  },
-                  {
-                    name: 'BRANCH_NAME',
-                    value: branchName,
-                    type: 'PLAINTEXT'
-                  }
-                ]);
-            })
-        );
-      }
+    if (deleted) {
+      return deleteEcrRepository(branchName);
+    } else if (created) {
+      return createServiceRepositories(gitRepoName, commitHash, 'backend/services', branchName, (repository, serviceName, serviceDirectory) =>
+        buildImage(commitHash, awsRegion, gitRepoName, repository, serviceDirectory, accountId, branchName)
+      );
+    } else {
+      return updateErcImages(gitRepoName, commitHash, branchName, repository =>
+        buildImage(commitHash, awsRegion, gitRepoName, repository, `backend/services/${serviceName}`, accountId, branchName)
+      );
     }
 
-    return Promise.allSettled(imageActions);
   } catch (error) {
     console.error('An error occurred building images', error);
   }
 };
+
+exports.handler = handler;
