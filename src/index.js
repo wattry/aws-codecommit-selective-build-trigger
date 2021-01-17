@@ -1,18 +1,16 @@
 const AWS = require('aws-sdk');
+const path = require('path');
 
 const codecommit = new AWS.CodeCommit();
 const codebuild = new AWS.CodeBuild();
 const ecr = new AWS.ECR();
 
-const {
-  basename,
-  sep
-} = require('path');
-
-const EXTENSIONS = ["js"];
+const EXTENSIONS = [".js"];
 const FILENAMES = ["DockerFile", "Dockerfile"];
 const {
-  CODE_BUILD_PROJECT = 'wattry-ecr-poc-CodeBuild-Job'
+  CODE_BUILD_PROJECT = 'wattry-ecr-poc-CodeBuild-Job',
+  SERVICES_PATH = 'backend/services',
+  SERVICE_PREFIX = 'customer-portal'
 } = process.env;
 
 async function getLastCommitID(repositoryName, branchName) {
@@ -61,8 +59,8 @@ async function getFileDifferences(repositoryName, lastCommitID, previousCommitID
   return differences;
 }
 
-function getServicesDirectories(repositoryName, folderPath, commitSpecifier) {
-  return codecommit.getFolder({ repositoryName, folderPath, commitSpecifier }).promise()
+function getServicesDirectories(repositoryName, commitSpecifier) {
+  return codecommit.getFolder({ repositoryName, folderPath: SERVICES_PATH, commitSpecifier }).promise()
 }
 
 async function createEcrRepository(repositoryName) {
@@ -86,8 +84,9 @@ async function checkEcrRepository(repositoryName) {
     // If the ecr repository does not exist, then create one with the name provided.
     if (error.name && error.name === 'RepositoryNotFoundException') {
       try {
-        const { repository } = createEcrRepository(repositoryName);
+        const repository = await createEcrRepository(repositoryName);
 
+        console.log('Repository %s created', repository.repositoryName);
         return repository;
       } catch (error) {
         console.log('Unable to create repository: %s', repositoryName, error);
@@ -104,68 +103,73 @@ async function checkEcrRepository(repositoryName) {
  * @returns {Promise} - logs out when build is queued.
  */
 async function buildImage(
-  commitHash,
   awsRegion,
-  gitRepoName,
-  { repositoryName, repositoryUri },
-  imageDirectory,
   accountId,
+  commitHash,
+  gitRepoName,
   branchName,
+  ecrRepository,
+  serviceName,
+  serviceDirectory,
   environmentVariablesOverride = []
 ) {
-  try {
-    const buildOptions = {
-      projectName: CODE_BUILD_PROJECT,
-      sourceVersion: commitHash,
-      sourceTypeOverride: 'CODECOMMIT',
-      sourceLocationOverride: `https://git-codecommit.${awsRegion}.amazonaws.com/v1/repos/${gitRepoName}`,
-      environmentVariablesOverride: [
-        {
-          name: 'AWS_DEFAULT_REGION',
-          value: awsRegion,
-          type: 'PLAINTEXT'
-        },
-        {
-          name: 'ECR_REPO',
-          value: repositoryName,
-          type: 'PLAINTEXT'
-        }, {
-          name: 'ECR_REPO_URI',
-          value: repositoryUri,
-          type: 'PLAINTEXT'
-        }, {
-          name: 'AWS_ACCOUNT_ID',
-          value: accountId,
-          type: 'PLAINTEXT'
-        },
-        {
-          name: 'APP_DIR',
-          value: imageDirectory,
-          type: 'PLAINTEXT'
-        },
-        {
-          name: 'BRANCH_NAME',
-          value: branchName,
-          type: 'PLAINTEXT'
-        },
-        ...environmentVariablesOverride
-      ]
-    };
+  const { repositoryName, repositoryUri } = ecrRepository;
+  const buildOptions = {
+    projectName: CODE_BUILD_PROJECT,
+    sourceVersion: commitHash,
+    sourceTypeOverride: 'CODECOMMIT',
+    sourceLocationOverride: `https://git-codecommit.${awsRegion}.amazonaws.com/v1/repos/${gitRepoName}`,
+    environmentVariablesOverride: [
+      {
+        name: 'AWS_DEFAULT_REGION',
+        value: awsRegion,
+        type: 'PLAINTEXT'
+      },
+      {
+        name: 'ECR_REPO',
+        value: repositoryName,
+        type: 'PLAINTEXT'
+      }, {
+        name: 'ECR_REPO_URI',
+        value: repositoryUri,
+        type: 'PLAINTEXT'
+      }, {
+        name: 'AWS_ACCOUNT_ID',
+        value: accountId,
+        type: 'PLAINTEXT'
+      },
+      {
+        name: 'SERVICE_DIR',
+        value: serviceDirectory,
+        type: 'PLAINTEXT'
+      },
+      {
+        name: 'SERVICE_NAME',
+        value: serviceName,
+        type: 'PLAINTEXT'
+      },
+      {
+        name: 'BRANCH_NAME',
+        value: branchName,
+        type: 'PLAINTEXT'
+      },
+      ...environmentVariablesOverride
+    ]
+  };
 
-    const result = await codebuild.startBuild(buildOptions).promise();
-
-    console.log('Queued pipeline build');
-
-    return result;
-  } catch (error) {
-    console.error('Unable to queue pipeline build:', error);
-  }
+  return codebuild.startBuild(buildOptions).promise()
+    .then(() => {
+      console.log('Building Repository %s', repositoryName);
+    })
 }
 
-async function deleteEcrRepository(branchName) {
+async function deleteEcrRepository(branchName, serviceName) {
   try {
     const { repositories } = await ecr.describeRepositories().promise();
-    const regex = new RegExp(`^customer-portal.*.${branchName}$`);
+    const regex = serviceName
+      ? new RegExp(`^${SERVICE_PREFIX}.${serviceName}.${branchName}$`)
+      : new RegExp(`^${SERVICE_PREFIX}.*.${branchName}$`);
+
     const repositoriesToDelete = repositories.map(({ repositoryName }) => {
       if (!/master|main|dev|prod/.test(branchName) && regex.test(repositoryName)) {
         return ecr.deleteRepository({ repositoryName, force: true }).promise()
@@ -184,15 +188,19 @@ async function deleteEcrRepository(branchName) {
   }
 }
 
-async function createServiceRepositories(gitRepoName, commitHash, servicesPath, branchName, build) {
-  const { subFolders: serviceNames } = await getServicesDirectories(gitRepoName, servicesPath, commitHash);
+async function createServiceRepositories(gitRepoName, commitHash, branchName, build) {
+  const { subFolders: serviceNames } = await getServicesDirectories(gitRepoName, commitHash);
 
   return serviceNames
     .map(({
       relativePath: serviceName,
       absolutePath: serviceDirectory
-    }) => createEcrRepository(`customer-portal-${(serviceName)}-${branchName}`)
-      .then(repository => build(repository, serviceName, serviceDirectory))
+    }) => createEcrRepository(`${SERVICE_PREFIX}-${(serviceName)}-${branchName}`)
+      .then(repository => {
+        console.log('Repository created: %s', repository);
+
+        build(repository, serviceName, serviceDirectory)
+      })
       .catch(error => console.error('Unable to create service repository.', error.message))
     );
 }
@@ -202,27 +210,39 @@ async function updateErcImages(gitRepoName, commitHash, branchName, build) {
   const differences = await getFileDifferences(gitRepoName, commitHash, previousCommitID);
   const hasQueuedBuild = [];
 
-  const builds = differences.map(difference => {
+  console.log(differences);
+
+  const builds = differences.map((difference) => {
     const {
-      afterBlob: {
-        path
+      beforeBlob: {
+        path: servicePath,
       },
-      serviceDirectory,
-      serviceName = path.split(sep),
-      file = basename(path).split('.')
+      changeType,
+      deleted = changeType === 'D' ? true : false
     } = difference;
-    const [fileName, extension] = file;
+    const {
+      dir,
+      pathArray = dir.split(path.sep),
+      serviceName = pathArray[2],
+      serviceDirectory = pathArray.splice(0, 3).join(path.sep),
+      name: fileName,
+      ext: extension
+    } = path.parse(servicePath);
 
-    return
+    if (FILENAMES.includes(fileName) && deleted && !hasQueuedBuild.includes(serviceName)) {
+      hasQueuedBuild.push(serviceName);
 
-    if ((EXTENSIONS.includes(extension) || FILENAMES.includes(fileName)) && !hasQueuedBuild.includes(imageDirectory)) {
-      hasQueuedBuild.push(imageDirectory);
+      return deleteEcrRepository(branchName, serviceName);
 
-      return checkEcrRepository(`customer-portal-${imageDirectory}-${branchName}`)
-        .then(repository => build(repository, imageDirectory));
+    } else if ((EXTENSIONS.includes(extension) || FILENAMES.includes(fileName)) && !hasQueuedBuild.includes(serviceName)) {
+      hasQueuedBuild.push(serviceName);
+
+      return checkEcrRepository(`${SERVICE_PREFIX}-${serviceName}-${branchName}`)
+        .then(repository => build(repository, serviceName, serviceDirectory));
     }
 
-    console.log('Skipped %s', file);
+    console.log('Skipped %s', serviceName);
+    return { serviceName, fileName, status: 'skipped' };
   });
 
   return Promise.allSettled(builds);
@@ -230,7 +250,7 @@ async function updateErcImages(gitRepoName, commitHash, branchName, build) {
 
 const handler = async (event) => {
   try {
-    // console.log('event', JSON.stringify(event));
+    console.log('event', JSON.stringify(event));
     const {
       Records: [{
         awsRegion,
@@ -246,19 +266,19 @@ const handler = async (event) => {
       }],
       gitRepoName = eventSourceARN.split(':').pop(),
       accountId = eventSourceARN.split(':')[4],
-      branchName = basename(ref),
+      branchName = path.basename(ref),
       commitHash = commit || getLastCommitID(gitRepoName, branchName),
     } = event;
 
     if (deleted) {
       return deleteEcrRepository(branchName);
     } else if (created) {
-      return createServiceRepositories(gitRepoName, commitHash, 'backend/services', branchName, (repository, serviceName, serviceDirectory) =>
-        buildImage(commitHash, awsRegion, gitRepoName, repository, serviceDirectory, accountId, branchName)
+      return createServiceRepositories(gitRepoName, commitHash, branchName, (ecrRepository, serviceName, serviceDirectory) =>
+        buildImage(awsRegion, accountId, commitHash, gitRepoName, branchName, ecrRepository, serviceName, serviceDirectory)
       );
     } else {
-      return updateErcImages(gitRepoName, commitHash, branchName, repository =>
-        buildImage(commitHash, awsRegion, gitRepoName, repository, `backend/services/${serviceName}`, accountId, branchName)
+      return updateErcImages(gitRepoName, commitHash, branchName, (ecrRepository, serviceName, serviceDirectory) =>
+        buildImage(awsRegion, accountId, commitHash, gitRepoName, branchName, ecrRepository, serviceName, serviceDirectory)
       );
     }
 

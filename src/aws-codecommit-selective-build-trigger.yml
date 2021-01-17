@@ -34,6 +34,14 @@ Parameters:
     Default: lambda.zip
     Description: Define the Name of the S3 Bucket Key containing Lambda code zip
     Type: String
+  ServicesPath:
+    Default: 'backend/services'
+    Description: Directory in the customer portal project where service images files are located
+    Type: String
+  ServicesPrefix:
+    Default: 'customer-portal'
+    Description: Prefix for service images.
+    Type: String
 Resources:
   CodeCommitRepository:
     Type: AWS::CodeCommit::Repository
@@ -108,15 +116,15 @@ Resources:
                 - echo "Logging in to Amazon ECR..."
                 - $(aws ecr get-login --region $AWS_DEFAULT_REGION --no-include-email)
                 - COMMIT_HASH=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)
-                - IMAGE_TAG=$BRANCH_NAME\_${COMMIT_HASH:=latest}
+                - IMAGE_TAG=$BRANCH_NAME:latest
               finally:
                 - echo Phase INSTALL was COMPLETED on `date`
                 - if [ "$CODEBUILD_BUILD_SUCCEEDING" -eq 1 ]; then echo 'INSTALL SUCCESSFUL'; else echo 'INSTALL FAILED'; exit 1; fi
             build:
               commands:
                 - echo Phase BUILD was STARTED on `date`
-                - echo "Building the Docker image from " $APP_DIR
-                - docker build -f $APP_DIR/Dockerfile -t $ECR_REPO_URI:latest .
+                - echo "Building the Docker image from " $SERVICE_DIR
+                - docker build -f $SERVICE_DIR/Dockerfile -t $ECR_REPO_URI:latest .
               finally:
                 - echo Phase BUILD was COMPLETED on `date`
                 - if [ "$CODEBUILD_BUILD_SUCCEEDING" -eq 1 ]; then echo 'IMAGE BUILD SUCCESSFUL'; else echo 'IMAGE BUILD FAILED'; exit 1; fi
@@ -155,6 +163,8 @@ Resources:
       Environment:
         Variables:
           CODE_BUILD_PROJECT: !Ref CodeBuildImageJob
+          SERVICES_PATH: !Ref ServicesPath
+          SERVICE_PREFIX: !Ref ServicesPrefix
   LambdaTriggerRole:
     Type: AWS::IAM::Role
     Properties:
@@ -184,6 +194,7 @@ Resources:
                   - codecommit:GetTree
                   - codecommit:BatchGetCommits
                   - codecommit:GetCommit
+                  - codecommit:GetFolder
                   - codecommit:GetCommitHistory
                   - codecommit:GetDifferences
                   - codecommit:GetReferences
